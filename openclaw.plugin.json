@@ -1,0 +1,10 @@
+{
+  "id": "feishu",
+  "version": "0.2.0",
+  "channels": ["feishu"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

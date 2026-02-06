@@ -1,0 +1,30 @@
+{
+  "name": "openclaw-feishu-plugin",
+  "version": "0.2.0",
+  "description": "OpenClaw Feishu channel plugin (bridge parity)",
+  "type": "module",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.56.1",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "feishu",
+      "label": "Feishu",
+      "selectionLabel": "Feishu (Lark Open Platform)",
+      "detailLabel": "Feishu Bot",
+      "docsPath": "/channels/feishu",
+      "docsLabel": "feishu",
+      "blurb": "Feishu/Lark bot via WebSocket (bridge parity).",
+      "aliases": [
+        "lark"
+      ],
+      "order": 35,
+      "quickstartAllowFrom": true
+    }
+  }
+}
