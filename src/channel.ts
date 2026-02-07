@@ -9,18 +9,20 @@ import {
   buildChannelConfigSchema,
   DEFAULT_ACCOUNT_ID,
   deleteAccountFromConfigSection,
-  feishuOutbound,
   formatPairingApproveHint,
+  PAIRING_APPROVED_MESSAGE,
+  setAccountEnabledInConfigSection,
+} from "openclaw/plugin-sdk";
+import {
   listFeishuAccountIds,
   normalizeFeishuTarget,
-  PAIRING_APPROVED_MESSAGE,
   probeFeishu,
   resolveDefaultFeishuAccountId,
   resolveFeishuAccount,
   resolveFeishuConfig,
   resolveFeishuGroupRequireMention,
-  setAccountEnabledInConfigSection,
-} from "openclaw/plugin-sdk";
+} from "./compat.js";
+import { createFeishuOutbound } from "./outbound.js";
 import { FeishuConfigSchema } from "./config-schema.js";
 import { feishuOnboardingAdapter } from "./onboarding.js";
 import { monitorFeishuProvider, sendFeishuTextMessage } from "./feishu.js";
@@ -76,7 +78,7 @@ export function createFeishuPlugin(
       blockStreaming: true,
     },
     reload: { configPrefixes: ["channels.feishu"] },
-    outbound: feishuOutbound,
+    outbound: createFeishuOutbound(runtime, resolvePath),
     messaging: {
       normalizeTarget: normalizeFeishuTarget,
       targetResolver: {

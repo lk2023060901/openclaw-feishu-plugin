@@ -4,7 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { ChannelLogSink, OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk";
-import { extensionForMime, resolveFeishuConfig } from "openclaw/plugin-sdk";
+import { extensionForMime } from "openclaw/plugin-sdk";
+import { resolveFeishuConfig } from "./compat.js";
 
 const DEFAULT_THINKING_TEXT = process.env.FEISHU_THINKING_TEXT || "Thinking...";
 const THINKING_THRESHOLD_MS = Number(process.env.FEISHU_THINKING_THRESHOLD_MS ?? 2500);
@@ -29,6 +30,57 @@ const LOG_LEVELS: Record<string, number> = {
   info: 2,
   debug: 3,
 };
+
+type PendingReplyState = {
+  placeholderId: string;
+  placeholderIssued: boolean;
+  hasFinalReply: boolean;
+  createdAt: number;
+  lastUpdatedAt: number;
+};
+
+const DEFAULT_PENDING_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_PENDING_SWEEP_MS = 5 * 60 * 1000;
+const PENDING_REPLY_TTL_MS = Number.isFinite(Number(process.env.FEISHU_PLACEHOLDER_TTL_MS))
+  ? Math.max(1000, Number(process.env.FEISHU_PLACEHOLDER_TTL_MS))
+  : DEFAULT_PENDING_TTL_MS;
+const PENDING_REPLY_SWEEP_MS = Number.isFinite(Number(process.env.FEISHU_PLACEHOLDER_SWEEP_MS))
+  ? Math.max(1000, Number(process.env.FEISHU_PLACEHOLDER_SWEEP_MS))
+  : DEFAULT_PENDING_SWEEP_MS;
+
+const pendingReplies = new Map<string, PendingReplyState>();
+let pendingSweepTimer: NodeJS.Timeout | null = null;
+
+function ensurePendingSweep() {
+  if (pendingSweepTimer) {
+    return;
+  }
+  pendingSweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [id, state] of pendingReplies.entries()) {
+      if (now - state.lastUpdatedAt > PENDING_REPLY_TTL_MS) {
+        pendingReplies.delete(id);
+      }
+    }
+  }, PENDING_REPLY_SWEEP_MS);
+  pendingSweepTimer.unref?.();
+}
+
+function getPendingReplyState(messageId: string): PendingReplyState {
+  let state = pendingReplies.get(messageId);
+  if (!state) {
+    const now = Date.now();
+    state = {
+      placeholderId: "",
+      placeholderIssued: false,
+      hasFinalReply: false,
+      createdAt: now,
+      lastUpdatedAt: now,
+    };
+    pendingReplies.set(messageId, state);
+  }
+  return state;
+}
 
 type EventLogger = {
   logEvent: (level: "debug" | "info" | "warn" | "error", event: string, details?: Record<string, unknown>) => void;
@@ -76,6 +128,12 @@ type FeishuSender = {
 
 type FeishuMention = {
   key?: string;
+  id?: {
+    open_id?: string;
+    user_id?: string;
+    union_id?: string;
+  };
+  name?: string;
 };
 
 type FeishuMessage = {
@@ -123,6 +181,40 @@ const SUPPORTED_MSG_TYPES = new Set([
 
 const SEEN_TTL_MS = 10 * 60 * 1000;
 const seenMessages = new Map<string, number>();
+const botOpenIds = new Map<string, string>();
+
+async function fetchBotOpenId(client: Lark.Client, log?: ChannelLogSink) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK request helper
+    const response: any = await (client as any).request({
+      method: "GET",
+      url: "/open-apis/bot/v3/info",
+      data: {},
+    });
+    const bot = response?.bot ?? response?.data?.bot;
+    const openId = bot?.open_id;
+    if (!openId) {
+      log?.warn?.("feishu bot open_id missing from bot/v3/info response");
+      return undefined;
+    }
+    return String(openId);
+  } catch (err) {
+    log?.warn?.(`feishu bot open_id lookup failed: ${formatErr(err)}`);
+    return undefined;
+  }
+}
+
+function isBotMentioned(mentions: FeishuMention[], botOpenId?: string) {
+  if (!botOpenId) {
+    return false;
+  }
+  return mentions.some(
+    (mention) =>
+      mention.id?.open_id === botOpenId ||
+      mention.id?.user_id === botOpenId ||
+      mention.id?.union_id === botOpenId,
+  );
+}
 
 function isDuplicate(messageId?: string) {
   if (!messageId) {
@@ -693,8 +785,9 @@ async function downloadFeishuMessageResource(params: {
   maxBytes: number;
   fileName?: string;
 }): Promise<FeishuMediaRef> {
+  const requestType = params.type === "image" ? "image" : "file";
   const res = await params.client.im.messageResource.get({
-    params: { type: params.type },
+    params: { type: requestType },
     path: { message_id: params.messageId, file_key: params.fileKey },
   });
 
@@ -919,7 +1012,7 @@ async function downloadUrlToTempFile(runtime: PluginRuntime, url: string) {
   return { path: tmp, contentType: fetched.contentType };
 }
 
-async function uploadAndSendMedia(params: {
+export async function uploadAndSendMedia(params: {
   client: Lark.Client;
   runtime: PluginRuntime;
   receiveId: string;
@@ -1455,17 +1548,18 @@ export async function processFeishuMessage(params: {
     return;
   }
 
+  const messageId = message.message_id || "";
   const chatId = message.chat_id;
   if (!chatId) {
     params.eventLogger?.logWarnEvent("message_missing_chat_id", {
       accountId: params.accountId,
-      messageId: message.message_id,
+      messageId,
     });
     params.log?.warn?.("feishu event missing chat_id");
     return;
   }
 
-  if (isDuplicate(message.message_id)) {
+  if (messageId && isDuplicate(messageId)) {
     return;
   }
 
@@ -1581,9 +1675,23 @@ export async function processFeishuMessage(params: {
   }
 
   const mentions = message.mentions ?? payload.mentions ?? [];
-  const wasMentioned = mentions.length > 0;
+  const botOpenId = botOpenIds.get(params.accountId);
+  const wasMentioned = isBotMentioned(mentions, botOpenId);
+  const shouldMentionSender =
+    isGroup && wasMentioned && senderId && senderId !== "unknown";
+  let mentionSent = false;
+  const buildMentionPrefix = () => {
+    const displayName = senderName?.trim() || senderId;
+    return `<at user_id="${senderId}">${displayName}</at> `;
+  };
   if (isGroup) {
     const requireMention = groupConfig?.requireMention ?? true;
+    if (requireMention && !botOpenId) {
+      params.log?.warn?.(
+        "feishu bot open_id unavailable; skipping group message that requires mention",
+      );
+      return;
+    }
     if (requireMention && !wasMentioned) {
       return;
     }
@@ -1646,20 +1754,50 @@ export async function processFeishuMessage(params: {
   };
 
   const allowedOutboundDirs = resolveAllowedOutboundDirs(params.resolvePath);
+  const pendingState = messageId ? getPendingReplyState(messageId) : null;
+  if (pendingState) {
+    ensurePendingSweep();
+  }
 
   let thinkingTimer: NodeJS.Timeout | null = null;
-  let placeholderId = "";
-  let placeholderIssued = false;
+  let placeholderId = pendingState?.placeholderId ?? "";
+  let placeholderIssued = pendingState?.placeholderIssued ?? false;
+
+  const touchPendingState = () => {
+    if (pendingState) {
+      pendingState.lastUpdatedAt = Date.now();
+    }
+  };
+
+  const syncPlaceholderState = () => {
+    if (!pendingState) {
+      return;
+    }
+    if (pendingState.placeholderId && !placeholderId) {
+      placeholderId = pendingState.placeholderId;
+    }
+    if (pendingState.placeholderIssued && !placeholderIssued) {
+      placeholderIssued = true;
+    }
+  };
 
   const schedulePlaceholder = () => {
     if (THINKING_THRESHOLD_MS <= 0) {
       return;
     }
+    if (pendingState?.hasFinalReply) {
+      return;
+    }
+    syncPlaceholderState();
     if (thinkingTimer || placeholderId || placeholderIssued) {
       return;
     }
     thinkingTimer = setTimeout(async () => {
       thinkingTimer = null;
+      if (pendingState?.hasFinalReply) {
+        return;
+      }
+      syncPlaceholderState();
       if (placeholderId || placeholderIssued) {
         return;
       }
@@ -1672,8 +1810,17 @@ export async function processFeishuMessage(params: {
         );
         placeholderId = id || "";
         placeholderIssued = true;
+        if (pendingState) {
+          pendingState.placeholderId = placeholderId;
+          pendingState.placeholderIssued = true;
+          touchPendingState();
+        }
       } catch {
         placeholderIssued = true;
+        if (pendingState) {
+          pendingState.placeholderIssued = true;
+          touchPendingState();
+        }
       }
     }, THINKING_THRESHOLD_MS);
   };
@@ -1690,16 +1837,28 @@ export async function processFeishuMessage(params: {
     cfg: params.cfg,
     dispatcherOptions: {
       deliver: async (payload, info) => {
+        if (pendingState?.hasFinalReply) {
+          return;
+        }
+        syncPlaceholderState();
+        touchPendingState();
         const initialMedia = [
           ...(payload.mediaUrls ?? []),
           ...(payload.mediaUrl ? [payload.mediaUrl] : []),
         ];
         const channelCard = payload.channelData?.card;
+        const mentionPrefix =
+          shouldMentionSender && !mentionSent && payload.text?.trim()
+            ? buildMentionPrefix()
+            : "";
         const normalized = normalizeReplyForDelivery({
-          payloadText: payload.text ?? "",
+          payloadText: `${mentionPrefix}${payload.text ?? ""}`,
           mediaUrls: initialMedia,
           channelCard,
         });
+        if (mentionPrefix && normalized.text?.trim()) {
+          mentionSent = true;
+        }
 
         if (info.kind === "block") {
           if (!normalized.text) {
@@ -1710,10 +1869,17 @@ export async function processFeishuMessage(params: {
             try {
               const id = await sendText(params.client, chatId, normalized.text, "chat_id");
               placeholderId = id || "";
+              if (pendingState) {
+                pendingState.placeholderId = placeholderId;
+              }
             } catch {
               // ignore
             } finally {
               placeholderIssued = true;
+              if (pendingState) {
+                pendingState.placeholderIssued = true;
+                touchPendingState();
+              }
             }
             return;
           }
@@ -1724,11 +1890,18 @@ export async function processFeishuMessage(params: {
               const id = await sendText(params.client, chatId, normalized.text, "chat_id");
               if (id) {
                 placeholderId = id;
+                if (pendingState) {
+                  pendingState.placeholderId = placeholderId;
+                }
               }
             } catch {
               // ignore
             } finally {
               placeholderIssued = true;
+              if (pendingState) {
+                pendingState.placeholderIssued = true;
+                touchPendingState();
+              }
             }
           }
           return;
@@ -1750,6 +1923,10 @@ export async function processFeishuMessage(params: {
           log: params.log,
           eventLogger: params.eventLogger,
         });
+        if (info.kind === "final" && pendingState) {
+          pendingState.hasFinalReply = true;
+          touchPendingState();
+        }
       },
       onError: (err) => {
         clearPlaceholder();
@@ -1765,6 +1942,10 @@ export async function processFeishuMessage(params: {
             placeholderId,
             "（OpenClaw 未返回回复，可能超时或队列拥堵，请稍后重试）",
           ).catch(() => {});
+        }
+        if (pendingState) {
+          pendingState.hasFinalReply = true;
+          touchPendingState();
         }
       },
       onReplyStart: () => {
@@ -1810,6 +1991,11 @@ export async function monitorFeishuProvider(params: {
   }
 
   const client = createFeishuClient({ appId, appSecret, domain, log: params.log });
+  const botOpenId = await fetchBotOpenId(client, params.log);
+  botOpenIds.set(params.accountId, botOpenId ?? "");
+  params.log?.info?.(
+    `feishu[${params.accountId}] bot open_id resolved: ${botOpenId ?? "unknown"}`,
+  );
   const wsClient = createFeishuWsClient({ appId, appSecret, domain, log: params.log });
 
   const eventDispatcher = new Lark.EventDispatcher({}).register({
